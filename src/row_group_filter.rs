@@ -26,7 +26,7 @@ use crate::predicate::{ComparisonOp, Predicate, PredicateValue};
 use crate::row_index::RowGroupEntry;
 use crate::row_index::StripeRowIndex;
 use crate::schema::RootDataType;
-use log::debug;
+use log::error;
 use snafu::OptionExt;
 
 /// Evaluate a predicate against row group statistics
@@ -57,9 +57,21 @@ pub fn evaluate_predicate(
     schema: &RootDataType,
 ) -> Result<Vec<bool>> {
     let num_row_groups = row_index.num_row_groups();
+    error!(
+        "开始谓词下推评估: 行组数量={}, 谓词={:?}",
+        num_row_groups, predicate
+    );
     let mut result = vec![true; num_row_groups]; // Default: keep all
 
     evaluate_predicate_recursive(predicate, row_index, schema, &mut result)?;
+
+    let filtered_count = result.iter().filter(|&&keep| !keep).count();
+    error!(
+        "谓词下推完成: 总行组={}, 过滤掉={}, 保留={}",
+        num_row_groups,
+        filtered_count,
+        num_row_groups - filtered_count
+    );
 
     Ok(result)
 }
@@ -72,15 +84,19 @@ fn evaluate_predicate_recursive(
 ) -> Result<()> {
     match predicate {
         Predicate::Comparison { column, op, value } => {
+            error!("评估比较谓词: {} {:?} {:?}", column, op, value);
             evaluate_comparison(column, *op, value, row_index, schema, result)?;
         }
         Predicate::IsNull { column } => {
+            error!("评估 IS NULL 谓词: {}", column);
             evaluate_is_null(column, row_index, schema, result)?;
         }
         Predicate::IsNotNull { column } => {
+            error!("评估 IS NOT NULL 谓词: {}", column);
             evaluate_is_not_null(column, row_index, schema, result)?;
         }
         Predicate::And(predicates) => {
+            error!("评估 AND 组合谓词: {} 个子谓词", predicates.len());
             // For AND: start with all true, then apply each predicate
             // Row group is kept only if ALL predicates allow it
             for pred in predicates {
@@ -93,6 +109,7 @@ fn evaluate_predicate_recursive(
             }
         }
         Predicate::Or(predicates) => {
+            error!("评估 OR 组合谓词: {} 个子谓词", predicates.len());
             // For OR: start with all false, then apply each predicate
             // Row group is kept if ANY predicate allows it
             let mut temp_results = Vec::new();
@@ -107,6 +124,7 @@ fn evaluate_predicate_recursive(
             }
         }
         Predicate::Not(predicate) => {
+            error!("评估 NOT 谓词");
             // For NOT: evaluate predicate, then negate
             let mut temp_result = vec![true; result.len()];
             evaluate_predicate_recursive(predicate, row_index, schema, &mut temp_result)?;
@@ -141,6 +159,7 @@ fn evaluate_comparison(
 ) -> Result<()> {
     // Find column index
     let column_idx = find_column_index(schema, column)?;
+    error!("列 '{}' 索引: {}", column, column_idx);
 
     // Get row group index for this column
     let col_index = row_index.column(column_idx).context(UnexpectedSnafu {
@@ -162,19 +181,30 @@ fn evaluate_comparison(
 
         // Get statistics for this row group
         let stats_match = if let Some(stats) = &entry.statistics {
-            evaluate_comparison_with_stats(stats, op, value)?
+            let matched = evaluate_comparison_with_stats(stats, op, value)?;
+            error!(
+                "行组 #{}: 统计信息评估结果 = {}",
+                row_group_idx, matched
+            );
+            matched
         } else {
+            error!("行组 #{}: 无统计信息, 保留", row_group_idx);
             // No statistics available, keep row group (maybe)
             true
         };
 
         if !stats_match {
+            error!("行组 #{}: 被统计信息过滤", row_group_idx);
             *result_item = false;
             continue;
         }
 
         // After statistics say "maybe", use bloom filter (if available) to rule out equality predicates
-        *result_item = row_group_might_match_bloom(entry, op, value);
+        let bloom_match = row_group_might_match_bloom(entry, op, value);
+        if !bloom_match {
+            error!("行组 #{}: 被布隆过滤器过滤", row_group_idx);
+        }
+        *result_item = bloom_match;
     }
 
     Ok(())
@@ -341,14 +371,21 @@ fn row_group_might_match_bloom(
     }
 
     let bloom_filter = match entry.bloom_filter.as_ref() {
-        Some(filter) => filter,
-        None => return true,
+        Some(filter) => {
+            error!("使用布隆过滤器进行过滤");
+            filter
+        }
+        None => {
+            return true;
+        }
     };
 
     if let Some(hash) = bloom_value_hash64(value) {
-        bloom_filter.test_hash(hash)
+        let result = bloom_filter.test_hash(hash);
+        error!("布隆过滤器测试结果: {}", result);
+        result
     } else {
-        debug!("Skipping bloom filter: unsupported predicate value type");
+        error!("跳过布隆过滤器: 不支持的谓词值类型");
         true
     }
 }

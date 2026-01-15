@@ -26,6 +26,7 @@ use arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
 use futures::{ready, Stream};
 use futures_util::FutureExt;
+use log::error;
 
 use crate::array_decoder::NaiveStripeDecoder;
 use crate::arrow_reader::Cursor;
@@ -197,9 +198,17 @@ impl<R: AsyncChunkReader + 'static> ArrowStreamReader<R> {
                         // Evaluate predicate if present
                         let mut stripe_selection: Option<RowSelection> = None;
                         if let Some(ref predicate) = self.predicate {
+                            error!(
+                                "[Async] stripe: 开始谓词下推, 总行数={}",
+                                stripe_rows
+                            );
                             // Try to read row indexes for this stripe
                             match stripe.read_row_indexes(&self.file_metadata) {
                                 Ok(row_index) => {
+                                    error!(
+                                        "[Async] stripe: 成功读取行索引, 行组数={}",
+                                        row_index.num_row_groups()
+                                    );
                                     // Evaluate predicate against row group statistics
                                     match evaluate_predicate(
                                         predicate,
@@ -212,6 +221,13 @@ impl<R: AsyncChunkReader + 'static> ArrowStreamReader<R> {
                                                 .file_metadata
                                                 .row_index_stride()
                                                 .unwrap_or(10_000);
+                                            let selected_groups = row_group_filter.iter().filter(|&&keep| keep).count();
+                                            let total_groups = row_group_filter.len();
+                                            error!(
+                                                "[Async] stripe: 谓词下推成功! 保留 {}/{} 个行组",
+                                                selected_groups,
+                                                total_groups
+                                            );
                                             stripe_selection =
                                                 Some(RowSelection::from_row_group_filter(
                                                     &row_group_filter,
@@ -219,16 +235,24 @@ impl<R: AsyncChunkReader + 'static> ArrowStreamReader<R> {
                                                     stripe_rows,
                                                 ));
                                         }
-                                        Err(_) => {
+                                        Err(e) => {
                                             // Predicate evaluation failed (e.g., column not found)
                                             // Keep all rows (maybe)
+                                            error!(
+                                                "[Async] stripe: 谓词评估失败: {}, 保留所有行",
+                                                e
+                                            );
                                             stripe_selection =
                                                 Some(RowSelection::select_all(stripe_rows));
                                         }
                                     }
                                 }
-                                Err(_) => {
+                                Err(e) => {
                                     // Row indexes not available, keep all rows (maybe)
+                                    error!(
+                                        "[Async] stripe: 无法读取行索引: {}, 保留所有行",
+                                        e
+                                    );
                                     stripe_selection = Some(RowSelection::select_all(stripe_rows));
                                 }
                             }
